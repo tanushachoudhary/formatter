@@ -1,0 +1,6 @@
+streamlit==1.7.0
+python-docx==0.8.11
+altair>=4.0,<5
+click>=8.0,<8.1
+openai>=1.0.0
+python-dotenv>=1.0.0
