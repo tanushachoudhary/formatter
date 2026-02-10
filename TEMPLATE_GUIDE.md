@@ -161,6 +161,14 @@ Your template’s style definitions (bold, italic, font, spacing, borders) are p
 
 ---
 
+## Why the output can look different from what you pasted
+
+- **You pasted multiple versions or copies.** If your "generated text" is several pleadings or drafts pasted one after another (e.g. summons + complaint + another caption + summons again + allegations + …), the formatter will segment and render all of it. The app does not merge them into one short document. **Paste only the single document you want** (one caption, one body, one signature block) so the output matches that.
+- **Long duplicate paragraphs are now collapsed.** If the same long paragraph (e.g. the same summons or caption text) appears more than once, the formatter skips repeats after the first so you don’t get the same block many times. Short lines (e.g. "Plaintiff," or "Dated: [date]") can still repeat.
+- **Template and LLM control structure.** The template’s styles and the LLM’s segmentation (with template page images) decide where page breaks and headings go. Use a template that matches the single-document layout you want.
+
+---
+
 ## Optional: disable style-only injection
 
 By default the app uses **style-only** injection when a template structure is present (recommended for pixel-perfect matching). To make the app re-apply extracted paragraph/run format from the template instead, set:

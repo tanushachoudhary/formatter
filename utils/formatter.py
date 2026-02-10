@@ -41,11 +41,22 @@ NOT_LIST_CONTENT_PHRASES = (
 )
 
 
+# Intro sentences before numbered allegations — keep as body paragraph, never number these
+INTRO_PHRASES_NO_NUMBER = (
+    "at the time of the accident",
+    "at the time of the occurrence",
+    "at all times relevant herein",
+)
+
+
 def _looks_like_list_item(text: str) -> bool:
-    """True if text looks like a list item (numbered, lettered, or common list starters); False for address/signature."""
+    """True if text looks like a list item (numbered, lettered, or common list starters); False for address/signature/intro."""
     if not text or len(text.strip()) < 3:
         return False
     t = text.strip().lower()
+    for phrase in INTRO_PHRASES_NO_NUMBER:
+        if t.startswith(phrase):
+            return False
     for phrase in NOT_LIST_CONTENT_PHRASES:
         if phrase in t and not re.match(r"^[\dai]+[\.\)]\s*", t):
             return False
@@ -56,13 +67,71 @@ def _looks_like_list_item(text: str) -> bool:
         return True
     # Common list starters (any document type)
     list_starts = (
-        "that ", "first,", "second,", "third,", "plaintiff ", "defendant ", "the court ",
+        "that ", "first,", "second,", "third,", "plaintiff ", "plaintiff's ", "defendant ", "the court ",
         "movant ", "respondent ", "applicant ", "petitioner ", "1.", "2.", "a.", "b.",
+        "by reason of", "pursuant to", "the detailed", "the above-stated",
     )
     for start in list_starts:
         if t.startswith(start):
             return True
     return False
+
+
+# Starters for allegation-style paragraphs (so we can split one block into many numbered paragraphs)
+ALLEGATION_STARTERS = (
+    "that ",
+    "by reason of",
+    "pursuant to",
+    "plaintiff's ",
+    "the detailed ",
+    "the above-stated ",
+)
+
+
+def _starts_allegation(line: str) -> bool:
+    """True if line looks like the start of a numbered allegation (e.g. 'That on...', 'By reason of...')."""
+    if not line or len(line.strip()) < 10:
+        return False
+    t = line.strip().lower()
+    return any(t.startswith(s) for s in ALLEGATION_STARTERS)
+
+
+def _split_allegation_block(text: str) -> list[str]:
+    """If text contains multiple allegation-style paragraphs, split into one string per paragraph for numbering.
+    Splits on double newline first; if a chunk contains single newlines and allegation starters, split by line."""
+    if not text or not text.strip():
+        return []
+    text = text.strip()
+    # First split by double newline (paragraph boundaries)
+    chunks = re.split(r"\n\s*\n", text)
+    out = []
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        # If this chunk has single newlines and multiple lines that start like allegations, split further
+        lines = [ln.strip() for ln in chunk.split("\n") if ln.strip()]
+        if len(lines) <= 1:
+            out.append(chunk)
+            continue
+        # Check if we have multiple allegation starters in this chunk
+        allegation_lines = [i for i, ln in enumerate(lines) if _starts_allegation(ln)]
+        if len(allegation_lines) <= 1:
+            out.append(chunk)
+            continue
+        # Split: each line that starts an allegation begins a new paragraph; merge continuation lines
+        current = []
+        for ln in lines:
+            if _starts_allegation(ln) and current:
+                out.append(" ".join(current))
+                current = [ln]
+            elif _starts_allegation(ln):
+                current = [ln]
+            else:
+                current.append(ln)
+        if current:
+            out.append(" ".join(current))
+    return out if out else [text]
 
 
 def _get_paragraph_style_names(doc):
@@ -136,12 +205,12 @@ def _block_type_for_alignment(block_kind: str, section_type: str, style_name: st
 
 
 def enforce_legal_alignment(block_type: str, paragraph):
-    """Override alignment by block type — renderer controls semantics; template style controls appearance."""
+    """Override alignment: left for captions/headings/signatures; justify for body; consistent legal layout."""
     if not paragraph:
         return
     try:
         if block_type in ("heading", "section_header"):
-            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
         elif block_type in ("paragraph", "numbered", "body"):
             paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         elif block_type in ("signature", "address", "to_section"):
@@ -276,7 +345,7 @@ def _add_paragraph_with_inline_formatting(doc, segments: list[tuple[str, bool, b
 
 
 def _apply_run_format(run, fmt: dict):
-    """Apply stored run/font format (bold, italic, underline, font name/size, color) — exact Word document features."""
+    """Apply stored run/font format (bold, italic, underline, font name/size). Color is not applied so output stays black (legal standard)."""
     if not fmt or not run:
         return
     font = run.font
@@ -313,10 +382,9 @@ def _apply_run_format(run, fmt: dict):
             font.size = Pt(fmt["size_pt"])
     except Exception:
         pass
+    # Force black text (legal standard); do not copy template color (e.g. blue headings, hyperlinks)
     try:
-        hex_color = fmt.get("color_rgb_hex")
-        if hex_color and isinstance(hex_color, str) and len(hex_color) >= 6:
-            font.color.rgb = RGBColor.from_string(hex_color.strip()[:6])
+        font.color.rgb = RGBColor(0, 0, 0)
     except Exception:
         pass
 
@@ -370,6 +438,94 @@ NEW_DOCUMENT_START_PHRASES = (
     "supreme court of the state of new york",
     "supreme court of new york",
 )
+
+# Court caption patterns: use one consistent style for all so layout doesn't vary
+COURT_CAPTION_PHRASES = (
+    "superior court of",
+    "supreme court of",
+    "index no.:",
+    "index no.",
+    "date filed:",
+    "plaintiff,",
+    "defendant.",
+    "-against-",
+)
+
+# Phrases that start a major section: add space_before for clear separation
+SECTION_STARTER_PHRASES = (
+    "to the above named defendant",
+    "wherefore",
+    "dated",
+    "yours, etc",
+    "please take notice",
+)
+# Space before a section starter (pt) and after court caption (pt) for consistent structure
+SPACE_BEFORE_SECTION_PT = 12.0
+SPACE_AFTER_CAPTION_PT = 6.0
+
+# Numbered list (allegations): spacing and hanging indent for clean legal layout
+SPACE_BEFORE_NUMBERED_PT = 0.0
+SPACE_AFTER_NUMBERED_PT = 8.0   # space between each numbered point for readability
+NUMBERED_LEFT_INDENT_PT = 18.0   # body text indented 0.25"
+NUMBERED_FIRST_LINE_INDENT_PT = -18.0  # hanging: number left-aligned, description indented
+
+# Cause-of-action headings (e.g. "AS AND FOR A FIRST CAUSE OF ACTION:") — treat as section header
+CAUSE_OF_ACTION_PHRASE = "cause of action"
+
+
+def _looks_like_court_caption(text: str) -> bool:
+    """True if block text is a court caption line (so we can apply one consistent style)."""
+    if not text or len(text.strip()) < 3:
+        return False
+    t = text.strip().lower()
+    return any(p in t or t.startswith(p) for p in COURT_CAPTION_PHRASES)
+
+
+def _is_section_starter(text: str) -> bool:
+    """True if paragraph starts a major section (TO THE ABOVE NAMED DEFENDANT, WHEREFORE, Dated, etc.)."""
+    if not text or len(text.strip()) < 4:
+        return False
+    t = text.strip().lower()
+    return any(t.startswith(p) or t == p for p in SECTION_STARTER_PHRASES)
+
+
+def _looks_like_cause_of_action_heading(text: str) -> bool:
+    """True if paragraph is a cause-of-action heading (e.g. 'AS AND FOR A FIRST CAUSE OF ACTION:')."""
+    if not text or len(text.strip()) < 10:
+        return False
+    t = text.strip().lower()
+    return CAUSE_OF_ACTION_PHRASE in t and "as and for" in t
+
+
+def _apply_numbered_paragraph_layout(paragraph):
+    """Apply consistent spacing and hanging indent for numbered points: number left-aligned, description indented."""
+    if not paragraph:
+        return
+    try:
+        pf = paragraph.paragraph_format
+        pf.space_before = Pt(SPACE_BEFORE_NUMBERED_PT)
+        pf.space_after = Pt(SPACE_AFTER_NUMBERED_PT)
+        pf.left_indent = Pt(NUMBERED_LEFT_INDENT_PT)
+        pf.first_line_indent = Pt(NUMBERED_FIRST_LINE_INDENT_PT)
+    except Exception:
+        pass
+
+
+def _apply_section_spacing(paragraph, text: str, is_court_caption: bool):
+    """Set space_before for section starters and space_after for caption lines so sections are well-separated."""
+    if not paragraph:
+        return
+    try:
+        pf = paragraph.paragraph_format
+        if _is_section_starter(text):
+            pf.space_before = Pt(SPACE_BEFORE_SECTION_PT)
+        if _looks_like_cause_of_action_heading(text):
+            pf.space_before = Pt(SPACE_BEFORE_SECTION_PT)
+            pf.space_after = Pt(SPACE_AFTER_CAPTION_PT)
+        if is_court_caption:
+            pf.space_after = Pt(SPACE_AFTER_CAPTION_PT)
+    except Exception:
+        pass
 
 
 def _split_into_document_segments(blocks: list) -> list[list]:
@@ -502,15 +658,27 @@ def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_sampl
         return
 
     # Fallback path when no template_structure: still use style only; no fake numbering (Word handles via style).
+    # Deduplicate long repeated blocks (e.g. same summons/caption pasted multiple times) so output isn't bloated.
+    MIN_DEDUP_LEN = 80  # Only skip when this many chars and we've seen this exact text before
+    seen_long_text = set()
+
     segments = _split_into_document_segments(blocks)
     for seg_idx, segment in enumerate(segments):
         if seg_idx > 0:
             doc.add_page_break()
         caption_left, caption_right, body_blocks = _split_caption_body(segment)
         blocks_to_render = caption_left + caption_right + body_blocks if (caption_left or caption_right) else segment
+        section_break_added_in_segment = False
 
         for block_type, text in blocks_to_render:
             text = (text or "").strip()
+
+            # Skip long duplicate paragraphs (repeated summons, captions, allegations from concatenated input)
+            if len(text) >= MIN_DEDUP_LEN:
+                normalized = re.sub(r"\s+", " ", text).strip()
+                if normalized in seen_long_text:
+                    continue
+                seen_long_text.add(normalized)
 
             if block_type == "page_break":
                 doc.add_page_break()
@@ -572,10 +740,55 @@ def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_sampl
             if not text:
                 continue
 
-            style = block_type if block_type in valid_style_names else style_map.get(block_type, style_map.get("paragraph"))
-            if doc.paragraphs and _is_section_start(text, block_type, style_map, valid_style_names, section_heading_samples):
+            # Split one block into multiple numbered paragraphs when it contains many allegations (e.g. paste of "That on...", "By reason of...")
+            numbered_style = style_map.get("numbered") and (not valid_style_names or style_map["numbered"] in valid_style_names)
+            allegation_paras = _split_allegation_block(text) if numbered_style and _looks_like_list_item(text.split("\n")[0].strip() if "\n" in text else text) else []
+
+            if len(allegation_paras) > 1:
+                # Render each allegation as its own numbered paragraph (1., 2., 3., ...)
+                style = style_map["numbered"]
+                for one in allegation_paras:
+                    one = one.strip()
+                    if not one:
+                        continue
+                    one = re.sub(r"^\d+[\.\)]\s*", "", one).strip()
+                    one = re.sub(r"^[a-z][\.\)]\s*", "", one, count=1).strip()
+                    one = re.sub(r"^[ivx]+[\.\)]\s*", "", one, count=1, flags=re.IGNORECASE).strip()
+                    one = _render_checkboxes(one)
+                    segments = [(one, False, False)]
+                    _add_paragraph_with_inline_formatting(doc, segments, style, {})
+                    p = doc.paragraphs[-1] if doc.paragraphs else None
+                    if p:
+                        fmt = (style_formatting.get(style) or {}).get("paragraph_format") or {}
+                        _apply_paragraph_format(p, fmt)
+                        _apply_numbered_paragraph_layout(p)
+                        enforce_legal_alignment("numbered", p)
+                        clear_body_italic(p)
+                continue
+
+            is_court_caption = _looks_like_court_caption(text)
+            is_cause_of_action_heading = _looks_like_cause_of_action_heading(text)
+            # Use one consistent style for court caption lines; cause-of-action headings get section_header for clear distinction from numbered points
+            if is_court_caption:
+                style = style_map.get("section_header") or style_map.get("heading") or style_map.get("paragraph")
+                if not style or (valid_style_names and style not in valid_style_names):
+                    style = list(valid_style_names)[0] if valid_style_names else "Normal"
+            elif is_cause_of_action_heading:
+                style = style_map.get("section_header") or style_map.get("heading") or style_map.get("paragraph")
+                if not style or (valid_style_names and style not in valid_style_names):
+                    style = list(valid_style_names)[0] if valid_style_names else "Normal"
+            elif _looks_like_list_item(text) and numbered_style:
+                # Use numbered/list style so Word numbers allegations (1., 2., 3.)
+                style = style_map["numbered"]
+            else:
+                style = block_type if block_type in valid_style_names else style_map.get(block_type, style_map.get("paragraph"))
+            if not style:
+                style = list(valid_style_names)[0] if valid_style_names else "Normal"
+            # Only one page break per segment for "section start"
+            if doc.paragraphs and not section_break_added_in_segment and _is_section_start(text, block_type, style_map, valid_style_names, section_heading_samples):
                 doc.add_page_break()
-            # No fake numbering: list style from template drives numbering; strip leading "1. " from LLM if present
+                section_break_added_in_segment = True
+            # Strip leading "1." etc. when using list style so Word supplies the number
             if _looks_like_list_item(text):
                 text = re.sub(r"^\d+[\.\)]\s*", "", text).strip()
                 text = re.sub(r"^[a-z][\.\)]\s*", "", text, count=1).strip()
@@ -587,9 +800,12 @@ def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_sampl
             if p:
                 fmt = (style_formatting.get(style) or {}).get("paragraph_format") or {}
                 _apply_paragraph_format(p, fmt)
-                align_type = "section_header" if style in (style_map.get("heading"), style_map.get("section_header")) else "paragraph"
+                _apply_section_spacing(p, (text or "").strip(), is_court_caption=is_court_caption)
+                if style == style_map.get("numbered"):
+                    _apply_numbered_paragraph_layout(p)
+                align_type = "section_header" if style in (style_map.get("heading"), style_map.get("section_header")) else ("numbered" if style == style_map.get("numbered") else "paragraph")
                 enforce_legal_alignment(align_type, p)
-                if align_type == "paragraph":
+                if align_type == "paragraph" or align_type == "numbered":
                     clear_body_italic(p)
     trim_trailing_separators(doc)
 
