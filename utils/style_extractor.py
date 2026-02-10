@@ -5,11 +5,15 @@ import os
 
 from docx import Document
 from docx.enum.style import WD_STYLE_TYPE
+from docx.oxml.ns import qn
 from docx.shared import Length
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 
 STORE_DIR = "output"
 EXTRACTED_STYLES_FILE = "extracted_styles.json"
 EXTRACTED_STYLE_GUIDE_FILE = "extracted_style_guide.txt"
+EXTRACTED_BLUEPRINT_FILE = "document_blueprint.json"
 
 PREFERRED_HEADING_1 = ("Heading 1", "Title", "Titre 1")
 PREFERRED_HEADING_2 = ("Heading 2", "Subtitle", "Titre 2", "Section")
@@ -22,6 +26,27 @@ def _get_paragraph_style_names(doc):
         s.name for s in doc.styles
         if s.type == WD_STYLE_TYPE.PARAGRAPH
     ]
+
+
+def clone_styles(src_doc: Document, dst_doc: Document) -> None:
+    """Clone paragraph style definitions from template (src) to destination (dst).
+    Use when building a new document that must match template layout — then assign
+    paragraph.style = template_style_name so Word handles layout, numbering, spacing.
+    Does not copy numbering definitions; for that see numbering_part (Upgrade 2)."""
+    dst_names = {s.name for s in dst_doc.styles if s.type == WD_STYLE_TYPE.PARAGRAPH}
+    for style in src_doc.styles:
+        if style.type != WD_STYLE_TYPE.PARAGRAPH:
+            continue
+        if style.name in dst_names:
+            continue
+        try:
+            new_style = dst_doc.styles.add_style(style.name, WD_STYLE_TYPE.PARAGRAPH)
+            if getattr(style, "base_style", None) and style.base_style is not None:
+                base_name = style.base_style.name if hasattr(style.base_style, "name") else str(style.base_style)
+                if base_name in dst_names:
+                    new_style.base_style = dst_doc.styles[base_name]
+        except Exception:
+            pass
 
 
 def _pick_style(available, preferred_names, fallback_names=None):
@@ -54,7 +79,7 @@ def _enum_name(val):
 
 
 def _extract_paragraph_format(pf):
-    """Extract paragraph format to a JSON-serializable dict (including line_spacing and line_spacing_rule)."""
+    """Extract paragraph format to a JSON-serializable dict (Word document features: alignment, spacing, indents, line_spacing, keep_*, page_break_before)."""
     if pf is None:
         return {}
     out = {}
@@ -82,42 +107,43 @@ def _extract_paragraph_format(pf):
             out["line_spacing_rule"] = _enum_name(rule)
     except Exception:
         pass
+    for attr in ("page_break_before", "keep_with_next", "keep_together"):
+        try:
+            val = getattr(pf, attr, None)
+            if val is not None:
+                out[attr] = bool(val)
+        except Exception:
+            pass
+    try:
+        if getattr(pf, "widow_control", None) is not None:
+            out["widow_control"] = bool(pf.widow_control)
+    except Exception:
+        pass
+    try:
+        tab_stops = getattr(pf, "tab_stops", None)
+        if tab_stops is not None and hasattr(tab_stops, "__iter__"):
+            stops = []
+            for ts in tab_stops:
+                try:
+                    pos = _length_pt(getattr(ts, "position", None))
+                    align = _enum_name(getattr(ts, "alignment", None))
+                    leader = _enum_name(getattr(ts, "leader", None))
+                    if pos is not None or align or leader:
+                        stops.append({"position_pt": pos, "alignment": align, "leader": leader})
+                except Exception:
+                    pass
+            if stops:
+                out["tab_stops"] = stops
+    except Exception:
+        pass
     return out
 
 
 def _extract_run_format(run):
-    """Extract run/font format to a JSON-serializable dict (underline, bold, font name/size, etc.)."""
+    """Extract run/font format to a JSON-serializable dict (bold, italic, underline, font name/size, color)."""
     if run is None:
         return {}
-    font = run.font
-    out = {}
-    try:
-        if font.bold is not None:
-            out["bold"] = font.bold
-    except Exception:
-        pass
-    try:
-        if font.italic is not None:
-            out["italic"] = font.italic
-    except Exception:
-        pass
-    try:
-        u = font.underline
-        if u is not None:
-            out["underline"] = _enum_name(u) if hasattr(u, "name") else (True if u else False)
-    except Exception:
-        pass
-    try:
-        if font.name is not None:
-            out["name"] = font.name
-    except Exception:
-        pass
-    try:
-        if font.size is not None and hasattr(font.size, "pt"):
-            out["size_pt"] = font.size.pt
-    except Exception:
-        pass
-    return out
+    return _extract_run_format_from_font(run.font)
 
 
 def _format_from_style_definition(doc: Document, style_name: str) -> dict | None:
@@ -146,7 +172,7 @@ def _format_from_style_definition(doc: Document, style_name: str) -> dict | None
 
 
 def _extract_run_format_from_font(font) -> dict:
-    """Extract run format from a Font object (e.g. from a style)."""
+    """Extract run format from a Font object (e.g. from a style): bold, italic, underline, font name/size, color."""
     if font is None:
         return {}
     out = {}
@@ -176,6 +202,13 @@ def _extract_run_format_from_font(font) -> dict:
             out["size_pt"] = font.size.pt
     except Exception:
         pass
+    try:
+        if hasattr(font, "color") and font.color and getattr(font.color, "rgb", None):
+            rgb = font.color.rgb
+            if rgb is not None and len(rgb) >= 3:
+                out["color_rgb_hex"] = "%02x%02x%02x" % (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+    except Exception:
+        pass
     return out
 
 
@@ -201,10 +234,10 @@ DEFAULT_NUMBERED_FIRST_LINE_INDENT_PT = 0.0
 
 
 def _sample_formatting_per_style(doc: Document) -> dict:
-    """For each paragraph style used in the doc, sample one paragraph and extract its formatting."""
+    """For each paragraph style used in the doc (including in table cells), sample one paragraph and extract its formatting."""
     style_formatting = {}
     seen_styles = set()
-    for para in doc.paragraphs:
+    for para, _tid, _r, _c in iter_body_blocks(doc):
         try:
             style_name = para.style.name if para.style else None
         except Exception:
@@ -225,7 +258,8 @@ def _sample_formatting_per_style(doc: Document) -> dict:
 
 
 def _enrich_style_formatting_from_definitions(doc: Document, style_map: dict, style_formatting: dict) -> dict:
-    """Fill in formatting from style definitions; prefer paragraph sample for spacing so output matches template density."""
+    """Fill in formatting from style definitions. Preserve template spacing and indentation:
+    use paragraph sample when present, otherwise use style definition so output matches the template."""
     result = dict(style_formatting)
     for block_type, style_name in style_map.items():
         if not style_name:
@@ -234,24 +268,7 @@ def _enrich_style_formatting_from_definitions(doc: Document, style_map: dict, st
         from_def = _format_from_style_definition(doc, style_name)
         if from_def:
             merged = _merge_format(from_def, from_para)
-            # Prefer paragraph sample for vertical spacing: if the template's paragraphs had no explicit
-            # space_before/space_after/line_spacing, use 0 / single so we don't pull in the style's large values.
-            para_fmt_para = (from_para.get("paragraph_format") or {})
-            para_fmt_merged = merged.get("paragraph_format") or {}
-            for key in ("space_before", "space_after"):
-                if key not in para_fmt_para or para_fmt_para.get(key) is None:
-                    para_fmt_merged = dict(para_fmt_merged)
-                    para_fmt_merged[key] = 0.0
-            for key in ("line_spacing", "line_spacing_rule"):
-                if key not in para_fmt_para or para_fmt_para.get(key) is None:
-                    para_fmt_merged = dict(para_fmt_merged)
-                    if key == "line_spacing":
-                        para_fmt_merged["line_spacing"] = 1.0
-                    if key == "line_spacing_rule":
-                        para_fmt_merged["line_spacing_rule"] = "MULTIPLE"
-            if para_fmt_merged != (merged.get("paragraph_format") or {}):
-                merged = dict(merged)
-                merged["paragraph_format"] = para_fmt_merged
+            # Keep merged paragraph_format as-is so spacing/indent from template (style or paragraph) is preserved
             result[style_name] = merged
         elif style_name not in result:
             result[style_name] = {"paragraph_format": {}, "run_format": {}}
@@ -349,6 +366,34 @@ def _is_line_paragraph(para) -> bool:
     return has_symbol
 
 
+def _paragraph_has_bottom_border(para) -> bool:
+    """True if paragraph has a bottom border (used for section underlines under headings)."""
+    try:
+        p = getattr(para, "_p", None)
+        if p is None:
+            return False
+        pPr = p.find(qn("w:pPr"))
+        if pPr is None:
+            return False
+        pBdr = pPr.find(qn("w:pBdr"))
+        if pBdr is None:
+            return False
+        return pBdr.find(qn("w:bottom")) is not None
+    except Exception:
+        return False
+
+
+def _is_signature_line_paragraph(para) -> bool:
+    """True if paragraph looks like a signature underline (mostly underscores)."""
+    if not para or not para.text:
+        return False
+    t = para.text.strip()
+    if not t or len(t) < 2:
+        return False
+    without_underscore = t.replace("_", "").replace(" ", "")
+    return len(without_underscore) == 0 or (len(without_underscore) <= 2 and "_" in t)
+
+
 def _extract_line_samples(doc: Document) -> list[dict]:
     """Extract paragraphs that look like separator/signature lines from the template."""
     samples = []
@@ -401,6 +446,7 @@ def build_style_guide(style_map: dict, style_formatting: dict, all_style_names: 
     lines.append("- Signature block (attorney name, firm, address, phone): use the template style for that block; use block_type signature_line for the underline line.")
     lines.append("- Separator lines (dashes/dots ending in X) -> use block_type line and put the line characters in text.")
     lines.append("- Signature underlines -> use block_type signature_line (optional label in text).")
+    lines.append("- Section underlines (solid line under a cause of action or heading) -> use block_type section_underline with empty text.")
     lines.append("- Page break -> use block_type page_break with empty text before each new major section (as in the template).")
     lines.append("")
     lines.append("Style definitions (font, alignment, indent, etc.)")
@@ -416,10 +462,142 @@ def build_style_guide(style_map: dict, style_formatting: dict, all_style_names: 
     return "\n".join(lines).strip()
 
 
+def _section_label(text: str, index: int) -> str:
+    """Return a short section label for a template paragraph (for dynamic prompts)."""
+    t = (text or "").strip().lower()
+    if not t:
+        return "continuation"
+    if "supreme court" in t or "county of" in t[:30]:
+        return "court_header"
+    if "plaintiff" in t and ("against" in t or len(t) < 30):
+        return "case_caption_parties"
+    if "against" in t and len(t) < 20:
+        return "case_caption_parties"
+    if "defendant" in t and len(t) < 50:
+        return "case_caption_parties"
+    if "index no" in t or "index no." in t or "docket no" in t:
+        return "case_caption_index"
+    if "notice of motion" in t or "to restore" in t or "affirmation in support" in t or "affidavit of service" in t or "summons" in t or "complaint" in t:
+        if len(t) < 80:
+            return "document_title"
+    if "counselors" in t or "c o u n s e l o r s" in t:
+        return "counselors_header"
+    if "please take notice" in t or "take further notice" in t:
+        return "body_notice"
+    if t.startswith("dated") or t.startswith("dated:"):
+        return "date_line"
+    if "________" in t or ("_" in t and len(t.strip()) < 5):
+        return "signature_line"
+    if "attorneys for" in t and ("plaintiff" in t or "defendant" in t):
+        return "signature_block"
+    if t.strip() == "to:" or (t.startswith("to:") and len(t) < 10):
+        return "recipients_header"
+    if "state of new york" in t and ")" in t and "ss." in t:
+        return "affidavit_opening"
+    if "being duly sworn" in t or "duly sworn" in t:
+        return "affidavit_body"
+    return "body"
+
+
+def build_section_formatting_prompts(template_content: list, style_formatting: dict) -> str:
+    """Build per-section formatting instructions for the LLM (dynamic prompt per section type)."""
+    if not template_content or not style_formatting:
+        return ""
+    seen_sections = {}
+    lines = [
+        "Per-section formatting (apply the following to the corresponding parts of the raw text):",
+        "",
+    ]
+    for i, item in enumerate(template_content):
+        style_name = item.get("style") or "Normal"
+        text = (item.get("text") or "").strip()
+        section = _section_label(text, i)
+        fmt = style_formatting.get(style_name, {})
+        pf = fmt.get("paragraph_format", {})
+        run_fmt = fmt.get("run_format", {})
+        alignment = pf.get("alignment", "")
+        bold = run_fmt.get("bold", False)
+        parts = [f"Style: {style_name}"]
+        if alignment:
+            parts.append(f"alignment: {alignment.lower()}")
+        if bold:
+            parts.append("bold")
+        fmt_desc = ", ".join(parts)
+        # One prompt line per section type (first occurrence) or per distinct style in that section
+        key = (section, style_name)
+        if key not in seen_sections:
+            seen_sections[key] = True
+            snippet = (text[:50] + "…") if len(text) > 50 else text
+            if not snippet:
+                snippet = "(empty line)"
+            lines.append(f"• {section}: Use {fmt_desc}. Example content: \"{snippet}\"")
+    if len(lines) <= 2:
+        return ""
+    return "\n".join(lines)
+
+
+def iter_body_blocks(doc: Document):
+    """
+    Yield (paragraph, table_id, row, col) in document order.
+    table_id is None for top-level body paragraphs; inside tables, table_id is an int (0, 1, ...),
+    and row/col are 0-based cell indices. This includes paragraphs inside table cells so caption
+    content is not missed when the template uses a table for the caption.
+    """
+    body = doc.element.body
+    qp, qt = qn("w:p"), qn("w:tbl")
+    table_counter = 0
+    for child in body.iterchildren():
+        if child.tag == qp:
+            yield Paragraph(child, doc), None, None, None
+        elif child.tag == qt:
+            tbl = Table(child, doc)
+            for ri, row in enumerate(tbl.rows):
+                for ci, cell in enumerate(row.cells):
+                    for para in cell.paragraphs:
+                        yield para, table_counter, ri, ci
+            table_counter += 1
+        # skip sectPr and any other elements
+
+
+def extract_tables(doc: Document) -> list[dict]:
+    """
+    Extract table structure from the document: for each table, record index, dimensions (rows × cols),
+    and a short preview of cell contents. Tables are in document order (same order as in iter_body_blocks).
+    """
+    body = doc.element.body
+    qp, qt = qn("w:p"), qn("w:tbl")
+    tables_out = []
+    table_index = 0
+    for child in body.iterchildren():
+        if child.tag == qt:
+            tbl = Table(child, doc)
+            num_rows = len(tbl.rows)
+            num_cols = len(tbl.columns) if tbl.rows else 0
+            cell_preview = []
+            for row in tbl.rows:
+                row_preview = []
+                for cell in row.cells:
+                    parts = []
+                    for para in cell.paragraphs:
+                        t = (para.text or "").strip()
+                        if t:
+                            parts.append(t[:60] + ("…" if len(t) > 60 else ""))
+                    row_preview.append(" | ".join(parts) if parts else "")
+                cell_preview.append(row_preview)
+            tables_out.append({
+                "table_index": table_index,
+                "rows": num_rows,
+                "cols": num_cols,
+                "cell_preview": cell_preview,
+            })
+            table_index += 1
+    return tables_out
+
+
 def get_template_content_with_styles(doc: Document, max_paragraphs: int = 120, max_text_per_para: int = 400) -> list[dict]:
     """Extract each paragraph's style name and text so the LLM can see how the template was formatted."""
     out = []
-    for i, para in enumerate(doc.paragraphs):
+    for i, (para, _tid, _r, _c) in enumerate(iter_body_blocks(doc)):
         if i >= max_paragraphs:
             break
         try:
@@ -431,6 +609,239 @@ def get_template_content_with_styles(doc: Document, max_paragraphs: int = 120, m
             text = text[: max_text_per_para] + "..."
         out.append({"style": style_name or "Normal", "text": text})
     return out
+
+
+def _extract_section_heading_samples(doc: Document) -> list[str]:
+    """Extract normalized text of paragraphs that have 'page break before' in the template (for section breaks)."""
+    seen = set()
+    out = []
+    for para, _tid, _r, _c in iter_body_blocks(doc):
+        try:
+            if not getattr(para.paragraph_format, "page_break_before", None):
+                continue
+        except Exception:
+            continue
+        text = (para.text or "").strip()
+        if not text or len(text) < 2:
+            continue
+        key = text.lower().strip()
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _infer_section_type(hint: str, block_kind: str) -> str:
+    """Infer legal document section from block hint (for layout enforcement)."""
+    t = (hint or "").strip().lower()
+    if block_kind in ("line", "signature_line"):
+        return "separator"
+    if not t or t == "(empty)":
+        return "body"
+    if any(x in t for x in ("supreme court", "county of", "index no", "index number", "notice of motion", "to restore", "affirmation in support", "affidavit of service", "c o u n s e l o r s", "counselors:", "plaintiff", "defendant", "-against-", "against")):
+        return "caption"
+    if any(x in t for x in ("please take notice", "take further notice", "for an order")):
+        return "motion_notice"
+    if any(x in t for x in ("attorneys for", "attorney for", "law firm", "esq.", "pllc", "p.c.")) and any(c.isdigit() for c in t):
+        return "attorney_signature"
+    if t.startswith("to:") or (len(t) < 5 and "to" in t):
+        return "to_section"
+    if any(x in t for x in ("affirms the following", "respectfully submitted", "it is respectfully", "wherefore")):
+        return "affirmation"
+    if any(x in t for x in ("duly sworn", "being duly sworn", "under the penalties of perjury")):
+        return "affidavit"
+    if any(x in t for x in ("sworn to before me", "notary public", "state of ", "county of ")) and len(t) < 120:
+        return "notary"
+    if "dated:" in t and len(t) < 80:
+        return "body"
+    return "body"
+
+
+def extract_template_structure(doc: Document, max_paragraphs: int = 500) -> list[dict]:
+    """
+    Extract the exact structure of the template: one block spec per paragraph, in document order.
+    Includes paragraphs inside table cells (e.g. caption) so slot-fill has the right number of slots.
+    Each block has: style, paragraph_format, run_format, block_kind, section_type, template_text,
+    page_break_before, hint; and optionally table_id, row, col when inside a table.
+    """
+    block_specs = []
+    for i, (para, table_id, row, col) in enumerate(iter_body_blocks(doc)):
+        if i >= max_paragraphs:
+            break
+        try:
+            style_name = para.style.name if para.style else "Normal"
+        except Exception:
+            style_name = "Normal"
+        pf = para.paragraph_format
+        paragraph_format = _extract_paragraph_format(pf) if pf else {}
+        run_format = {}
+        if para.runs:
+            run_format = _extract_run_format(para.runs[0])
+        page_break_before = False
+        try:
+            if pf and getattr(pf, "page_break_before", None):
+                page_break_before = True
+        except Exception:
+            pass
+        text = (para.text or "").strip()
+        if _is_signature_line_paragraph(para):
+            block_kind = "signature_line"
+            template_text = text or "_________________________"
+        elif _is_line_paragraph(para):
+            block_kind = "line"
+            template_text = text or "----------------------------------------------------------------------X"
+        elif not text and _paragraph_has_bottom_border(para):
+            block_kind = "section_underline"
+            template_text = None
+        else:
+            block_kind = "paragraph"
+            template_text = None
+        hint = (text[:80] + "…") if text and len(text) > 80 else (text or "(empty)")
+        section_type = _infer_section_type(hint, block_kind)
+        spec = {
+            "style": style_name,
+            "paragraph_format": paragraph_format,
+            "run_format": run_format,
+            "block_kind": block_kind,
+            "section_type": section_type,
+            "template_text": template_text,
+            "page_break_before": page_break_before,
+            "hint": hint,
+        }
+        if table_id is not None:
+            spec["table_id"] = table_id
+            spec["row"] = row
+            spec["col"] = col
+        block_specs.append(spec)
+    return block_specs
+
+
+def _extract_document_layout(doc: Document) -> dict:
+    """Extract page layout: margins, page size, orientation, section breaks (formatting metadata only)."""
+    out = {"sections": []}
+    try:
+        for idx, section in enumerate(doc.sections):
+            sec = {}
+            for attr in ("top_margin", "bottom_margin", "left_margin", "right_margin", "page_width", "page_height"):
+                try:
+                    val = getattr(section, attr, None)
+                    if val is not None:
+                        sec[attr] = _length_pt(val) if hasattr(val, "pt") else (getattr(val, "inches", None) if val else None)
+                        if sec[attr] is None and hasattr(val, "pt"):
+                            sec[attr] = val.pt
+                except Exception:
+                    pass
+            try:
+                orient = getattr(section, "orientation", None)
+                if orient is not None:
+                    sec["orientation"] = _enum_name(orient)
+            except Exception:
+                pass
+            if sec:
+                sec["section_index"] = idx
+                out["sections"].append(sec)
+    except Exception:
+        pass
+    return out
+
+
+def extract_document_blueprint(doc: Document) -> dict:
+    """
+    Extract the complete style and layout blueprint: styles, sections, tables, lists, document_layout.
+    Formatting metadata only (no document text except as identifiers). Machine-readable schema
+    for programmatic application to another document.
+    """
+    para_names = _get_paragraph_style_names(doc)
+    style_formatting = _sample_formatting_per_style(doc)
+    # Enrich from style definitions so we have full style system
+    style_map = {}
+    if para_names:
+        heading_like = [n for n in para_names if any(kw in n.lower() for kw in ("heading", "title", "titre", "section"))]
+        list_like = [n for n in para_names if "list" in n.lower() or "number" in n.lower()]
+        h1 = _pick_style(para_names, PREFERRED_HEADING_1, heading_like)
+        h2 = _pick_style(para_names, PREFERRED_HEADING_2, [n for n in heading_like if n != h1])
+        normal = _pick_style(para_names, PREFERRED_NORMAL, para_names)
+        list_style = _pick_style(para_names, PREFERRED_LIST, list_like) if list_like else normal
+        style_map = {"heading": h1 or normal, "section_header": h2 or h1 or normal, "paragraph": normal, "numbered": list_style, "wherefore": h2 or h1 or normal}
+    style_formatting = _enrich_style_formatting_from_definitions(doc, style_map, style_formatting) if style_map else style_formatting
+
+    # Build styles: each style name -> full paragraph_format + run_format (font, size, color, alignment, spacing, indent, tab_stops, etc.)
+    styles = {}
+    for style_name in (para_names or []):
+        fmt = style_formatting.get(style_name)
+        if not fmt:
+            defn = _format_from_style_definition(doc, style_name)
+            fmt = defn or {"paragraph_format": {}, "run_format": {}}
+        pf = fmt.get("paragraph_format") or {}
+        rf = fmt.get("run_format") or {}
+        styles[style_name] = {
+            "paragraph_format": pf,
+            "run_format": rf,
+        }
+
+    # Document layout: margins, page size, orientation
+    document_layout = _extract_document_layout(doc)
+
+    # Sections: structural roles from template_structure (caption, heading, body, signature_block, etc.)
+    template_structure = extract_template_structure(doc, max_paragraphs=500)
+    sections = []
+    for i, spec in enumerate(template_structure):
+        role = spec.get("section_type", "body")
+        style_name = spec.get("style", "Normal")
+        sections.append({
+            "index": i,
+            "type": role,
+            "style": style_name,
+            "block_kind": spec.get("block_kind", "paragraph"),
+            "formatting": {
+                "paragraph_format": spec.get("paragraph_format") or {},
+                "run_format": spec.get("run_format") or {},
+            },
+            "page_break_before": spec.get("page_break_before", False),
+        })
+
+    # Tables: row/col count, style only (no cell text per blueprint rules)
+    body = doc.element.body
+    qt = qn("w:tbl")
+    tables = []
+    for table_idx, child in enumerate(body.iterchildren()):
+        if child.tag == qt:
+            tbl = Table(child, doc)
+            rows = len(tbl.rows)
+            cols = len(tbl.columns) if tbl.rows else 0
+            table_style = None
+            try:
+                table_style = getattr(tbl, "style", None) and getattr(tbl.style, "name", None)
+            except Exception:
+                pass
+            tables.append({
+                "table_index": table_idx,
+                "rows": rows,
+                "cols": cols,
+                "style": table_style,
+            })
+
+    # Lists: list-like styles and their formatting (indent, numbering)
+    list_styles = []
+    for name in (para_names or []):
+        if "list" in name.lower() or "number" in name.lower():
+            fmt = style_formatting.get(name, {})
+            pf = fmt.get("paragraph_format") or {}
+            list_styles.append({
+                "style_name": name,
+                "paragraph_format": pf,
+                "run_format": fmt.get("run_format") or {},
+            })
+
+    return {
+        "document_layout": document_layout,
+        "styles": styles,
+        "sections": sections,
+        "tables": tables,
+        "lists": list_styles,
+        "style_map": style_map,
+        "line_samples": _extract_line_samples(doc),
+    }
 
 
 def extract_styles(doc: Document) -> dict:
@@ -461,6 +872,16 @@ def extract_styles(doc: Document) -> dict:
     style_formatting = _sample_formatting_per_style(doc)
     style_formatting = _enrich_style_formatting_from_definitions(doc, style_map, style_formatting)
     style_formatting = _apply_default_spacing_and_indent(style_map, style_formatting)
+    # Prevent template alignment/italic poisoning: body styles get no inherited center or italic
+    body_style_names = ("normal", "body text", "list paragraph", "list number", "list")
+    for style_name in list(style_formatting.keys()):
+        if (style_name or "").lower() in body_style_names:
+            fmt = style_formatting[style_name]
+            pf = (fmt.get("paragraph_format") or {}).copy()
+            pf["alignment"] = None
+            rf = (fmt.get("run_format") or {}).copy()
+            rf["italic"] = False
+            style_formatting[style_name] = {**fmt, "paragraph_format": pf, "run_format": rf}
     line_samples = _extract_line_samples(doc)
     style_guide = build_style_guide(
         style_map=style_map,
@@ -469,6 +890,9 @@ def extract_styles(doc: Document) -> dict:
     )
 
     template_content = get_template_content_with_styles(doc)
+    section_heading_samples = _extract_section_heading_samples(doc)
+    template_structure = extract_template_structure(doc)
+    tables = extract_tables(doc)
 
     return {
         "paragraph_style_names": para_names,
@@ -477,6 +901,9 @@ def extract_styles(doc: Document) -> dict:
         "style_guide": style_guide,
         "line_samples": line_samples,
         "template_content": template_content,
+        "section_heading_samples": section_heading_samples,
+        "template_structure": template_structure,
+        "tables": tables,
     }
 
 
@@ -500,6 +927,27 @@ def load_extracted_styles(base_dir: str = None) -> dict | None:
     """Load extracted style schema from JSON. Returns None if file missing."""
     base_dir = base_dir or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     filepath = os.path.join(base_dir, STORE_DIR, EXTRACTED_STYLES_FILE)
+    if not os.path.isfile(filepath):
+        return None
+    with open(filepath, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_document_blueprint(blueprint: dict, base_dir: str = None) -> str:
+    """Save the document blueprint (style/layout schema) to JSON. Returns path to file."""
+    base_dir = base_dir or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    store_path = os.path.join(base_dir, STORE_DIR)
+    os.makedirs(store_path, exist_ok=True)
+    filepath = os.path.join(store_path, EXTRACTED_BLUEPRINT_FILE)
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(blueprint, f, indent=2, ensure_ascii=False)
+    return filepath
+
+
+def load_document_blueprint(base_dir: str = None) -> dict | None:
+    """Load the document blueprint from JSON. Returns None if file missing."""
+    base_dir = base_dir or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    filepath = os.path.join(base_dir, STORE_DIR, EXTRACTED_BLUEPRINT_FILE)
     if not os.path.isfile(filepath):
         return None
     with open(filepath, encoding="utf-8") as f:
