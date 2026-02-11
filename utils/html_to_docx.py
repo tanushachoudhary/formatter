@@ -79,10 +79,13 @@ def _legal_paragraph_format(text: str) -> dict:
     if not text or not text.strip():
         return {}
     t = text.strip()
+    # Never center or apply header formatting to long paragraphs (body text)
+    if len(t) > 80:
+        return {}
     lower = t.lower()
     out = {}
-    # Court header: center
-    if "supreme court" in lower and ("new york" in lower or "state" in lower) or (t.startswith("COUNTY OF") and len(t) < 50):
+    # Court header: center (Supreme Court, Superior Court, County of X, New Haven County)
+    if (("supreme court" in lower or "superior court" in lower) and ("new york" in lower or "state" in lower or "county" in lower or "connecticut" in lower)) or (t.startswith("COUNTY OF") and len(t) < 50) or (t.startswith("NEW HAVEN") and "COUNTY" in t and len(t) < 50):
         out["alignment"] = "center"
     # Document title: center + bold
     elif t in ("SUMMONS", "VERIFIED COMPLAINT", "COMPLAINT") or (len(t) < 25 and t.isupper() and "cause" not in lower):
@@ -103,10 +106,9 @@ def _legal_paragraph_format(text: str) -> dict:
     # -against-: center
     elif t == "-against-" or t.strip() == "-against-":
         out["alignment"] = "center"
-    # Firm name / address block (centered): often all caps or has comma/numbers
-    elif "pllc" in lower or "p.c." in lower or "esq." in lower:
-        if len(t) < 80:
-            out["alignment"] = "center"
+    # Firm name / signature line (centered): short line with firm/lawyer marker only
+    elif (("pllc" in lower or "p.c." in lower or "esq." in lower) and len(t) < 60):
+        out["alignment"] = "center"
     return out
 
 
@@ -305,12 +307,16 @@ def html_to_docx_bytes(html: str, font_name: str | None = None, font_size_pt: fl
         p = doc.add_paragraph()
         full_text = "".join(r[0] or "" for r in runs).strip()
         legal_fmt = _legal_paragraph_format(full_text)
-        if block.get("alignment") and block["alignment"] in align_map:
-            p.alignment = align_map[block["alignment"]]
+        # Ignore editor "center" so body stays left/justify. Use editor left/right/justify only.
+        block_align = block.get("alignment")
+        if block_align in ("left", "right", "justify") and block_align in align_map:
+            p.alignment = align_map[block_align]
         elif legal_fmt.get("alignment") and legal_fmt["alignment"] in align_map:
             p.alignment = align_map[legal_fmt["alignment"]]
-        elif not (list_item or _looks_like_numbered_paragraph(runs)) and len(full_text) > 60:
-            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        elif len(full_text) > 60:
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY  # body and long numbered paragraphs justified
+        else:
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
         if list_item or _looks_like_numbered_paragraph(runs):
             p.paragraph_format.left_indent = HANG_INDENT
             p.paragraph_format.first_line_indent = FIRST_LINE_INDENT
@@ -349,6 +355,16 @@ def html_to_docx_bytes(html: str, font_name: str | None = None, font_size_pt: fl
 
 # Marker for section underlines (solid line under headings) in plain-text preview
 SECTION_UNDERLINE_MARKER = "[SECTION_UNDERLINE]"
+
+
+def normalize_editor_html(html: str) -> str:
+    """Normalize editor HTML so double breaks become paragraph boundaries."""
+    if not html:
+        return "<p><br></p>"
+    html = re.sub(r"(<br\s*/?>\s*){2,}", "</p><p>", html, flags=re.I)
+    if "<p" not in html.lower():
+        html = "<p>" + html + "</p>"
+    return html
 
 
 def plain_text_to_simple_html(text: str) -> str:

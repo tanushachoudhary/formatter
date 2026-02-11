@@ -6,6 +6,7 @@ Pillow>=9.0.0
 pytesseract>=0.3.10
 altair>=4.0,<5
 click>=8.0,<8.1
+google-genai>=1.0.0
 openai>=1.0.0
 python-dotenv>=1.0.0
 streamlit-quill>=0.0.3

@@ -224,13 +224,13 @@ def _merge_format(base: dict, override: dict) -> dict:
     return out
 
 
-# Default spacing/indent when template has none. Use 0 so output matches tight,
-# single-spaced templates; template-defined spacing is always preserved.
-DEFAULT_SPACE_AFTER_PT = 0.0
+# Default spacing when template has none. Give visible space between paragraphs.
+DEFAULT_SPACE_AFTER_PT = 6.0
 DEFAULT_SPACE_BEFORE_HEADING_PT = 0.0
 DEFAULT_FIRST_LINE_INDENT_PT = 0.0
-DEFAULT_NUMBERED_LEFT_INDENT_PT = 0.0
-DEFAULT_NUMBERED_FIRST_LINE_INDENT_PT = 0.0
+# Hanging indent for numbered list items (e.g. "1. That on..."); 0.5 in indent, first line -0.5 in = number hangs left
+DEFAULT_NUMBERED_LEFT_INDENT_PT = 36.0   # 0.5 inch
+DEFAULT_NUMBERED_FIRST_LINE_INDENT_PT = -36.0  # hanging
 
 
 def _sample_formatting_per_style(doc: Document) -> dict:
@@ -291,9 +291,10 @@ def _apply_default_spacing_and_indent(style_map: dict, style_formatting: dict) -
     if list_style and list_style in result:
         pf = result[list_style].get("paragraph_format") or {}
         pf = dict(pf)
-        if pf.get("left_indent") is None:
+        # Treat 0 as missing so templates with no indent get legal hanging indent
+        if pf.get("left_indent") is None or pf.get("left_indent") == 0:
             pf["left_indent"] = DEFAULT_NUMBERED_LEFT_INDENT_PT
-        if pf.get("first_line_indent") is None:
+        if pf.get("first_line_indent") is None or pf.get("first_line_indent") == 0:
             pf["first_line_indent"] = DEFAULT_NUMBERED_FIRST_LINE_INDENT_PT
         if pf.get("space_after") is None:
             pf["space_after"] = DEFAULT_SPACE_AFTER_PT
