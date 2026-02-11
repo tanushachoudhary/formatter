@@ -11,3 +11,5 @@ python-dotenv>=1.0.0
 streamlit-quill>=0.0.3
 streamlit-lexical>=1.0.0
 markdown>=3.4.0
+mammoth>=1.6.0
+beautifulsoup4>=4.12.0
