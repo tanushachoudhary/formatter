@@ -1,0 +1,79 @@
+{
+  "hash": "d8c05648",
+  "configHash": "a867ca3e",
+  "lockfileHash": "6187264c",
+  "browserHash": "c460c84e",
+  "optimized": {
+    "react/jsx-dev-runtime": {
+      "src": "../../node_modules/react/jsx-dev-runtime.js",
+      "file": "react_jsx-dev-runtime.js",
+      "fileHash": "9ed1ed76",
+      "needsInterop": true
+    },
+    "react": {
+      "src": "../../node_modules/react/index.js",
+      "file": "react.js",
+      "fileHash": "71b3e911",
+      "needsInterop": true
+    },
+    "react-dom/client": {
+      "src": "../../node_modules/react-dom/client.js",
+      "file": "react-dom_client.js",
+      "fileHash": "d6e0f59f",
+      "needsInterop": true
+    },
+    "@tiptap/react": {
+      "src": "../../node_modules/@tiptap/react/dist/index.js",
+      "file": "@tiptap_react.js",
+      "fileHash": "7e7cd23b",
+      "needsInterop": false
+    },
+    "@tiptap/starter-kit": {
+      "src": "../../node_modules/@tiptap/starter-kit/dist/index.js",
+      "file": "@tiptap_starter-kit.js",
+      "fileHash": "cc00b248",
+      "needsInterop": false
+    },
+    "@tiptap/extension-underline": {
+      "src": "../../node_modules/@tiptap/extension-underline/dist/index.js",
+      "file": "@tiptap_extension-underline.js",
+      "fileHash": "2f440934",
+      "needsInterop": false
+    },
+    "@tiptap/extension-text-align": {
+      "src": "../../node_modules/@tiptap/extension-text-align/dist/index.js",
+      "file": "@tiptap_extension-text-align.js",
+      "fileHash": "eadd0019",
+      "needsInterop": false
+    },
+    "@tiptap/extension-text-style": {
+      "src": "../../node_modules/@tiptap/extension-text-style/dist/index.js",
+      "file": "@tiptap_extension-text-style.js",
+      "fileHash": "3ce637cc",
+      "needsInterop": false
+    },
+    "@tiptap/extension-font-family": {
+      "src": "../../node_modules/@tiptap/extension-font-family/dist/index.js",
+      "file": "@tiptap_extension-font-family.js",
+      "fileHash": "7253539d",
+      "needsInterop": false
+    }
+  },
+  "chunks": {
+    "chunk-HCGKX5ED": {
+      "file": "chunk-HCGKX5ED.js"
+    },
+    "chunk-WNPTCGAH": {
+      "file": "chunk-WNPTCGAH.js"
+    },
+    "chunk-MNDJYEN3": {
+      "file": "chunk-MNDJYEN3.js"
+    },
+    "chunk-SCMW75XP": {
+      "file": "chunk-SCMW75XP.js"
+    },
+    "chunk-5WRI5ZAA": {
+      "file": "chunk-5WRI5ZAA.js"
+    }
+  }
+}
