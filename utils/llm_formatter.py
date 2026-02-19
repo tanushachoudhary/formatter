@@ -7,6 +7,18 @@ import re
 from utils.style_extractor import build_section_formatting_prompts
 
 
+# Phrases sometimes emitted by the model instead of/in addition to JSON; strip before parsing.
+_LLM_REFUSAL_PATTERN = re.compile(
+    r"\s*I'm sorry, but I can't assist with that\.?\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_llm_refusal_artifact(raw: str) -> str:
+    """Remove common refusal phrase that would break JSON (e.g. mid-response)."""
+    return _LLM_REFUSAL_PATTERN.sub("\n", raw)
+
+
 def _sanitize_json_control_chars(raw: str) -> str:
     """Replace unescaped control characters inside JSON string values so json.loads succeeds."""
     # Match double-quoted string contents (handles \" inside)
@@ -37,6 +49,27 @@ def _sanitize_json_control_chars(raw: str) -> str:
         result.append(raw[i])
         i += 1
     return "".join(result)
+
+
+def _recover_truncated_at_position(raw: str, pos: int) -> list[dict] | None:
+    """When parse fails at pos (e.g. 63466), try truncating at the last '}' before pos that yields valid JSON."""
+    if pos <= 0 or pos > len(raw):
+        return None
+    # Search backwards from pos-1 for '}' (within last 8k chars to avoid slow scan)
+    start = max(0, pos - 8192)
+    for i in range(pos - 1, start - 1, -1):
+        if raw[i] == "}":
+            prefix = raw[: i + 1].rstrip()
+            if prefix.endswith(","):
+                prefix = prefix[:-1].rstrip()
+            if prefix.startswith("["):
+                try:
+                    data = json.loads(prefix + "]")
+                    if isinstance(data, list):
+                        return data
+                except json.JSONDecodeError:
+                    pass
+    return None
 
 
 def _recover_truncated_blocks_json(raw: str) -> list[dict] | None:
@@ -210,6 +243,91 @@ def _extract_text_values_from_json_array(raw: str, expected_count: int) -> list[
             out.append("")
     return out[:expected_count]
 
+
+def _read_json_string_value(raw: str, i: int) -> tuple[str, int] | None:
+    """From position i (after opening quote), read a JSON string value; return (value, next_index) or None."""
+    if i >= len(raw) or raw[i] != '"':
+        return None
+    i += 1
+    val = []
+    while i < len(raw):
+        c = raw[i]
+        if c == '\\' and i + 1 < len(raw):
+            val.append(raw[i + 1])
+            i += 2
+            continue
+        if c == '"':
+            return ("".join(val), i + 1)
+        if ord(c) < 32:
+            val.append(" ")
+        else:
+            val.append(c)
+        i += 1
+    return None
+
+
+def _extract_blocks_from_malformed_json(raw: str) -> list[dict] | None:
+    """When JSON is malformed (e.g. unescaped quote at column 63k), extract block_type+text objects by scanning."""
+    raw = raw.strip()
+    if not raw.startswith("["):
+        return None
+    out = []
+    i = raw.find("[") + 1
+    while i < len(raw):
+        # Find start of object
+        obj_start = raw.find('{"', i)
+        if obj_start == -1:
+            obj_start = raw.find("{", i)
+        if obj_start == -1:
+            break
+        i = obj_start + 1
+        block_type_val = None
+        text_val = None
+        # Scan for "block_type": "..." and "text": "..."
+        while i < len(raw):
+            # Skip whitespace and commas
+            while i < len(raw) and raw[i] in " \t\n\r,}":
+                if raw[i] == "}":
+                    break
+                i += 1
+            if i >= len(raw) or raw[i] == "}":
+                break
+            if raw[i] != '"':
+                i += 1
+                continue
+            key = None
+            if raw[i : i + 13] == '"block_type"':
+                key = "block_type"
+                i += 13
+            elif raw[i : i + 7] == '"text"':
+                key = "text"
+                i += 7
+            else:
+                i += 1
+                continue
+            while i < len(raw) and raw[i] in " \t\n\r":
+                i += 1
+            if i >= len(raw) or raw[i] != ":":
+                continue
+            i += 1
+            while i < len(raw) and raw[i] in " \t\n\r":
+                i += 1
+            parsed = _read_json_string_value(raw, i)
+            if parsed is None:
+                break
+            value, i = parsed
+            if key == "block_type":
+                block_type_val = value
+            else:
+                text_val = value
+        if block_type_val is not None or text_val is not None:
+            out.append({
+                "block_type": (block_type_val or "paragraph").strip() or "paragraph",
+                "text": (text_val or "").strip(),
+            })
+    return out if out else None
+
+
 # Optional: use OpenAI or Azure OpenAI
 try:
     from openai import AzureOpenAI, OpenAI
@@ -249,6 +367,19 @@ Rules (apply to any document type):
 - Page breaks -> output page_break (empty text) before each major section that starts on a new page in the template. Look at the template structure to see where sections begin.
 - Motion packs (Notice of Motion + Affirmation + Affidavit): output all documents in order. Each document has a caption (court, county, parties, index no., document title like NOTICE OF MOTION TO RESTORE / AFFIRMATION IN SUPPORT / AFFIDAVIT OF SERVICE) then body. Use the same template styles for caption and body as in the template. Do not merge multiple documents into one; keep each document's caption and body as separate blocks in sequence.
 - Checkboxes: Use [ ] and [x] in text; they render as checkbox symbols.
+
+Numbered allegations (e.g. under FIRST CAUSE OF ACTION / NEGLIGENCE):
+- Output each allegation as a SEPARATE block. One block per "That on...", "That the...", "By reason of...", "Pursuant to...", "Plaintiff's damages...", etc. Do not merge multiple allegations into one block.
+- Assign the template's list/numbered style (from the style guide) as block_type for each such allegation so the document engine can apply numbering dynamically from the template.
+- Do NOT add numbers or letters in the text (no "1.", "2.", "3.", "a.", "b."). Numbering is applied by the engine from the uploaded template; your job is to segment and assign the list style.
+- Output the ENTIRE document. Do not stop early: include all sections through the end. Every part of the raw text must appear in the output.
+
+Complaint structure (when present in raw text)—output each as separate blocks with the template's styles:
+- WHEREFORE clause (e.g. "WHEREFORE, Plaintiff demands judgment...") -> one block; then each demand for relief ("For compensatory damages...", "For costs and disbursements...", "For such other and further relief...") as its own block using the template's body or list style (do not add "1." "2." in text).
+- Jury demand (e.g. "Plaintiff hereby demands a trial by jury...") -> separate block.
+- Dated + signature block (Dated: ... [Attorney Name], ESQ., Law Firm, Attorneys for Plaintiff, address, phone) -> use template styles; use signature_line for the underline.
+- Attorney verification (if present) -> separate blocks for the heading, body paragraphs, and signature. Use the same styles as in the template for verification.
+- The document does NOT end at the first attorney signature. If the raw text continues after "Yours, etc.;" or after the first signature block with any of: WHEREFORE and demands for relief, another caption (e.g. MUMUNI AHMED, Index No.:), verification (ATTORNEY'S VERIFICATION / affirms under penalties of perjury), SUMMONS AND VERIFIED COMPLAINT footer, certification (22 NYCRR 130-1.1(c)), Service of a copy... admitted, or NOTICE OF ENTRY—you MUST output blocks for every one of those sections. Continue until the very end of the raw text.
 
 Reply with a JSON array only. Each element: {"block_type": "<exact style name from template or line/signature_line/page_break>", "text": "<content>"}."""
 
@@ -309,7 +440,7 @@ def _call_openai(
 
 ---
 
-Raw text to format. Match the template structure above: use the same styles for titles, section headings, body paragraphs, and lists as in the template. Insert page_break where the template starts a new section on a new page. Output plain text only. Output a JSON array of {{"block_type": "<style name or line/signature_line/page_break>", "text": "<content>"}}.
+Raw text to format. Match the template structure above: use the same styles for titles, section headings, body paragraphs, and lists as in the template. For causes of action (e.g. negligence): output each allegation (each "That on...", "By reason of...", etc.) as a separate block with the template's list/numbered style; do not add "1." or "2." in the text—numbering is applied from the template. Insert page_break where the template starts a new section on a new page. Include every part of the raw text to the very end—do not stop after the first signature block; if WHEREFORE, verification, SUMMONS AND VERIFIED COMPLAINT, certification, or NOTICE OF ENTRY appear later in the raw text, output blocks for all of them. Output plain text only. Output a JSON array of {{"block_type": "<style name or line/signature_line/page_break>", "text": "<content>"}}.
 
 ---
 {text}
@@ -357,6 +488,8 @@ Raw text to format. Match the template structure above: use the same styles for 
         client = OpenAI(api_key=api_key)
         model = os.environ.get("FORMATTER_LLM_MODEL", "gpt-4o-mini")
 
+    # Default 16384 (many models' max). Set FORMATTER_LLM_MAX_TOKENS for models that allow more (e.g. 32768).
+    max_tokens = int(os.environ.get("FORMATTER_LLM_MAX_TOKENS", "16384"))
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -364,9 +497,10 @@ Raw text to format. Match the template structure above: use the same styles for 
             {"role": "user", "content": content},
         ],
         temperature=0.1,
-        max_tokens=16384,
+        max_tokens=max_tokens,
     )
     raw = resp.choices[0].message.content.strip()
+    raw = _strip_llm_refusal_artifact(raw)
     # Strip markdown code fence if present
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -375,15 +509,32 @@ Raw text to format. Match the template structure above: use the same styles for 
     raw = _sanitize_json_control_chars(raw)
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
         raw_fallback = re.sub(r"[\x00-\x1f]", " ", raw)
+        data = None
         try:
             data = json.loads(raw_fallback)
-        except json.JSONDecodeError:
-            # Truncated response (e.g. "Expecting value" at 59k): use last complete objects
-            data = _recover_truncated_blocks_json(raw_fallback)
+        except json.JSONDecodeError as e2:
+            # Use error position (e.g. column 63467) to try parsing content before the bad spot
+            pos = getattr(e2, "pos", None)
+            if pos is not None and pos > 0:
+                prefix = raw_fallback[:pos].rstrip()
+                if prefix.endswith(","):
+                    prefix = prefix[:-1].rstrip()
+                if prefix.startswith("[") and prefix.endswith("}"):
+                    try:
+                        data = json.loads(prefix + "]")
+                    except json.JSONDecodeError:
+                        pass
+                # Truncation may be inside a string (no trailing "}"); search backwards for last valid object end
+                if data is None:
+                    data = _recover_truncated_at_position(raw_fallback, pos)
+            if data is None:
+                data = _recover_truncated_blocks_json(raw_fallback)
             if data is None:
                 data = _recover_truncated_blocks_json(raw)
+            if data is None:
+                data = _extract_blocks_from_malformed_json(raw_fallback)
             if data is None:
                 raise
     out = []
@@ -556,6 +707,9 @@ def format_text_with_llm(
     When use_slot_fill=False or no template_structure: segment entire text into blocks (all content rendered).
     template_page_images: optional list of base64 PNG strings (one per template page) for vision.
     template_page_ocr_texts: optional OCR text per page (Tesseract) for layout/structure reference."""
+    # Remove refusal artifact from INPUT so WHEREFORE, signature, verification etc. are all formatted (not cut off)
+    text = _strip_llm_refusal_artifact(text or "")
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()  # collapse excess newlines left after removal
     template_structure = style_schema.get("template_structure") if use_slot_fill else None
     if template_structure:
         slot_texts = _call_openai_slot_fill(text, style_schema)

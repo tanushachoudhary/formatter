@@ -57,8 +57,9 @@ def _looks_like_list_item(text: str) -> bool:
     for phrase in INTRO_PHRASES_NO_NUMBER:
         if t.startswith(phrase):
             return False
+    # Only exclude when line starts with address/signature phrases (avoid "court" in "all lower courts" etc.)
     for phrase in NOT_LIST_CONTENT_PHRASES:
-        if phrase in t and not re.match(r"^[\dai]+[\.\)]\s*", t):
+        if t.startswith(phrase) and not re.match(r"^[\dai]+[\.\)]\s*", t):
             return False
     if re.match(r"^\(\d{3}\)\s*\d{3}-\d{4}", t):
         return False
@@ -87,10 +88,26 @@ ALLEGATION_STARTERS = (
     "the above-stated ",
 )
 
+# NOTICE OF ENTRY / NOTICE OF SETTLEMENT — do not number these even if they start with "that "
+NOTICE_ENTRY_SETTLEMENT_STARTERS = (
+    "that the within",
+    "that an order of which the within",
+)
+
+
+def _is_notice_of_entry_or_settlement(text: str) -> bool:
+    """True if paragraph is NOTICE OF ENTRY or NOTICE OF SETTLEMENT text (do not apply list numbering)."""
+    if not text or len(text.strip()) < 15:
+        return False
+    t = text.strip().lower()
+    return any(t.startswith(s) for s in NOTICE_ENTRY_SETTLEMENT_STARTERS)
+
 
 def _starts_allegation(line: str) -> bool:
     """True if line looks like the start of a numbered allegation (e.g. 'That on...', 'By reason of...')."""
     if not line or len(line.strip()) < 10:
+        return False
+    if _is_notice_of_entry_or_settlement(line):
         return False
     t = line.strip().lower()
     return any(t.startswith(s) for s in ALLEGATION_STARTERS)
@@ -232,6 +249,35 @@ def clear_body_italic(paragraph):
         pass
 
 
+def force_legal_run_format(paragraph):
+    """Force black color and no italic on all runs (avoids blue/hyperlink/italic from template styles)."""
+    if not paragraph:
+        return
+    try:
+        for run in paragraph.runs:
+            try:
+                run.font.color.rgb = RGBColor(0, 0, 0)
+            except Exception:
+                pass
+            try:
+                run.font.italic = False
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def force_legal_run_format_document(doc):
+    """Force black color and no italic on every paragraph in the document."""
+    if not doc:
+        return
+    try:
+        for paragraph in doc.paragraphs:
+            force_legal_run_format(paragraph)
+    except Exception:
+        pass
+
+
 def _apply_paragraph_format(paragraph, fmt: dict):
     """Apply stored paragraph format dict (exact Word features: alignment, spacing, indent, line_spacing, keep_*, page_break_before)."""
     if not fmt or not paragraph:
@@ -344,6 +390,25 @@ def _add_paragraph_with_inline_formatting(doc, segments: list[tuple[str, bool, b
     return p
 
 
+def _apply_num_pr(paragraph, num_id: int, ilvl: int = 0):
+    """Set Word list numbering on a paragraph (numPr) so it displays as 1., 2., 3."""
+    if not paragraph or num_id is None:
+        return
+    try:
+        p_el = paragraph._element
+        pPr = p_el.get_or_add_pPr()
+        numPr = OxmlElement("w:numPr")
+        numId_el = OxmlElement("w:numId")
+        numId_el.set(qn("w:val"), str(num_id))
+        numPr.append(numId_el)
+        ilvl_el = OxmlElement("w:ilvl")
+        ilvl_el.set(qn("w:val"), str(ilvl))
+        numPr.append(ilvl_el)
+        pPr.append(numPr)
+    except Exception:
+        pass
+
+
 def _apply_run_format(run, fmt: dict):
     """Apply stored run/font format (bold, italic, underline, font name/size). Color is not applied so output stays black (legal standard)."""
     if not fmt or not run:
@@ -382,9 +447,13 @@ def _apply_run_format(run, fmt: dict):
             font.size = Pt(fmt["size_pt"])
     except Exception:
         pass
-    # Force black text (legal standard); do not copy template color (e.g. blue headings, hyperlinks)
+    # Force black text and no italic (legal standard); do not copy template color (e.g. blue) or italic
     try:
         font.color.rgb = RGBColor(0, 0, 0)
+    except Exception:
+        pass
+    try:
+        font.italic = False
     except Exception:
         pass
 
@@ -588,10 +657,11 @@ def _resolve_style(block_type: str, style_map: dict, style_formatting: dict):
     return style_map.get(block_type, style_map.get("paragraph"))
 
 
-def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_samples=None, section_heading_samples=None, template_structure=None):
+def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_samples=None, section_heading_samples=None, template_structure=None, numbered_num_id=None, numbered_ilvl=0):
     """Inject text into template structure. When template_structure is provided (slot-fill):
     assign paragraph.style = template style only — no manual formatting. Word handles layout,
-    numbering, spacing from style definitions. Renderer never invents formatting."""
+    numbering, spacing from style definitions. Renderer never invents formatting.
+    numbered_num_id/numbered_ilvl: when set, paragraphs with the numbered style get list numbering (1., 2., 3.)."""
     if style_map is None:
         style_map = _build_style_map_from_doc(doc)
     if not style_map:
@@ -742,10 +812,14 @@ def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_sampl
 
             # Split one block into multiple numbered paragraphs when it contains many allegations (e.g. paste of "That on...", "By reason of...")
             numbered_style = style_map.get("numbered") and (not valid_style_names or style_map["numbered"] in valid_style_names)
-            allegation_paras = _split_allegation_block(text) if numbered_style and _looks_like_list_item(text.split("\n")[0].strip() if "\n" in text else text) else []
+            first_line = text.split("\n")[0].strip() if "\n" in text else text
+            lines_in_block = [ln.strip() for ln in text.split("\n") if ln.strip()]
+            has_any_allegation = any(_starts_allegation(ln) for ln in lines_in_block)
+            allegation_paras = _split_allegation_block(text) if numbered_style and (_looks_like_list_item(first_line) or (len(lines_in_block) > 1 and has_any_allegation)) else []
 
             if len(allegation_paras) > 1:
-                # Render each allegation as its own numbered paragraph (1., 2., 3., ...)
+                # Render each allegation as its own numbered paragraph. Do NOT hardcode "1.", "2." as text:
+                # strip any leading number from content and apply Word numPr so the template controls numbering.
                 style = style_map["numbered"]
                 for one in allegation_paras:
                     one = one.strip()
@@ -761,7 +835,11 @@ def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_sampl
                     if p:
                         fmt = (style_formatting.get(style) or {}).get("paragraph_format") or {}
                         _apply_paragraph_format(p, fmt)
-                        _apply_numbered_paragraph_layout(p)
+                        # Number only negligence-style allegations (That on..., By reason of..., The above-stated...), not WHEREFORE demands or other points
+                        if numbered_num_id is not None and _starts_allegation(one):
+                            _apply_num_pr(p, numbered_num_id, numbered_ilvl)
+                        if _starts_allegation(one):
+                            _apply_numbered_paragraph_layout(p)
                         enforce_legal_alignment("numbered", p)
                         clear_body_italic(p)
                 continue
@@ -782,13 +860,16 @@ def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_sampl
                 style = style_map["numbered"]
             else:
                 style = block_type if block_type in valid_style_names else style_map.get(block_type, style_map.get("paragraph"))
+            # If LLM gave paragraph/body but content is an allegation (That on..., By reason of...), use numbered style so it gets numbered
+            if style != style_map.get("numbered") and _starts_allegation((text or "").strip()) and numbered_style:
+                style = style_map["numbered"]
             if not style:
                 style = list(valid_style_names)[0] if valid_style_names else "Normal"
             # Only one page break per segment for "section start"
             if doc.paragraphs and not section_break_added_in_segment and _is_section_start(text, block_type, style_map, valid_style_names, section_heading_samples):
                 doc.add_page_break()
                 section_break_added_in_segment = True
-            # Strip leading "1." etc. when using list style so Word supplies the number
+            # Do NOT hardcode numbers: strip leading "1." etc. so Word (via numPr/template style) supplies the number
             if _looks_like_list_item(text):
                 text = re.sub(r"^\d+[\.\)]\s*", "", text).strip()
                 text = re.sub(r"^[a-z][\.\)]\s*", "", text, count=1).strip()
@@ -800,10 +881,15 @@ def inject_blocks(doc, blocks, style_map=None, style_formatting=None, line_sampl
             if p:
                 fmt = (style_formatting.get(style) or {}).get("paragraph_format") or {}
                 _apply_paragraph_format(p, fmt)
-                _apply_section_spacing(p, (text or "").strip(), is_court_caption=is_court_caption)
-                if style == style_map.get("numbered"):
+                # Number only negligence-style allegations (That on..., By reason of..., The above-stated...), not WHEREFORE or other points
+                txt_stripped = (text or "").strip()
+                is_negligence_allegation = style == style_map.get("numbered") and _starts_allegation(txt_stripped)
+                if is_negligence_allegation and numbered_num_id is not None:
+                    _apply_num_pr(p, numbered_num_id, numbered_ilvl)
+                _apply_section_spacing(p, txt_stripped, is_court_caption=is_court_caption)
+                if is_negligence_allegation:
                     _apply_numbered_paragraph_layout(p)
-                align_type = "section_header" if style in (style_map.get("heading"), style_map.get("section_header")) else ("numbered" if style == style_map.get("numbered") else "paragraph")
+                align_type = "section_header" if style in (style_map.get("heading"), style_map.get("section_header")) else ("numbered" if is_negligence_allegation else "paragraph")
                 enforce_legal_alignment(align_type, p)
                 if align_type == "paragraph" or align_type == "numbered":
                     clear_body_italic(p)

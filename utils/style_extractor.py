@@ -844,6 +844,42 @@ def extract_document_blueprint(doc: Document) -> dict:
     }
 
 
+def _get_numbering_from_template(doc: Document) -> tuple[int | None, int, str | None]:
+    """Return (num_id, ilvl, style_name) from the first template paragraph that has list numbering (numPr).
+    style_name is the paragraph's style so we use the template's own numbered style (no hardcoding)."""
+    try:
+        for para, _tid, _r, _c in iter_body_blocks(doc):
+            p_el = para._element
+            pPr = p_el.find(qn("w:pPr"))
+            if pPr is None:
+                continue
+            numPr = pPr.find(qn("w:numPr"))
+            if numPr is None:
+                continue
+            num_id_el = numPr.find(qn("w:numId"))
+            ilvl_el = numPr.find(qn("w:ilvl"))
+            num_id = None
+            ilvl = 0
+            if num_id_el is not None:
+                val = num_id_el.get(qn("w:val"))
+                if val is not None:
+                    num_id = int(val) if isinstance(val, str) and val.isdigit() else val
+            if ilvl_el is not None:
+                val = ilvl_el.get(qn("w:val"))
+                if val is not None:
+                    ilvl = int(val) if isinstance(val, str) and val.isdigit() else 0
+            style_name = None
+            try:
+                style_name = para.style.name if para.style else None
+            except Exception:
+                pass
+            if num_id is not None:
+                return (num_id, ilvl, style_name or "Normal")
+    except Exception:
+        pass
+    return (None, 0, None)
+
+
 def extract_styles(doc: Document) -> dict:
     """Extract paragraph style names, style map, per-style formatting, and template content for LLM."""
     para_names = _get_paragraph_style_names(doc)
@@ -861,11 +897,16 @@ def extract_styles(doc: Document) -> dict:
     normal = _pick_style(para_names, PREFERRED_NORMAL, para_names)
     list_style = _pick_style(para_names, PREFERRED_LIST, list_like) if list_like else normal
 
+    # Numbered style: use the template's own style from its first numbered paragraph (no hardcoding).
+    # If template has no numPr, fall back to list-like style by name.
+    numbered_num_id, numbered_ilvl, numbered_style_from_template = _get_numbering_from_template(doc)
+    numbered_style = numbered_style_from_template if (numbered_style_from_template and numbered_style_from_template in para_names) else list_style
+
     style_map = {
         "heading": h1 or normal,
         "section_header": h2 or h1 or normal,
         "paragraph": normal,
-        "numbered": list_style,
+        "numbered": numbered_style,
         "wherefore": h2 or h1 or normal,
     }
 
@@ -904,6 +945,8 @@ def extract_styles(doc: Document) -> dict:
         "section_heading_samples": section_heading_samples,
         "template_structure": template_structure,
         "tables": tables,
+        "numbered_num_id": numbered_num_id,
+        "numbered_ilvl": numbered_ilvl,
     }
 
 

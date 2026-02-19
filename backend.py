@@ -6,7 +6,13 @@ from docx import Document
 from docx.shared import Inches
 
 from utils.docx_to_images import docx_to_page_images, docx_to_page_images_base64, ocr_page_images
-from utils.formatter import clear_document_body, force_single_column, inject_blocks, remove_trailing_empty_and_noise
+from utils.formatter import (
+    clear_document_body,
+    force_legal_run_format_document,
+    force_single_column,
+    inject_blocks,
+    remove_trailing_empty_and_noise,
+)
 from utils.llm_formatter import format_text_with_llm
 from utils.style_extractor import (
     _paragraph_has_bottom_border,
@@ -119,7 +125,10 @@ def process_document(generated_text, template_file):
         line_samples=schema.get("line_samples", []),
         section_heading_samples=schema.get("section_heading_samples", []),
         template_structure=None,
+        numbered_num_id=schema.get("numbered_num_id"),
+        numbered_ilvl=schema.get("numbered_ilvl", 0),
     )
+    force_legal_run_format_document(doc)
     remove_trailing_empty_and_noise(doc)
 
     output_path = os.path.join(project_dir, "output", "formatted_output.docx")
